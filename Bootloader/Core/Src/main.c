@@ -19,6 +19,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "usb_device.h"
+#include "usbd_cdc_if.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -49,6 +50,9 @@ SPI_HandleTypeDef hspi1;
 uint8_t usb_rx_buffer[2048];
 uint32_t usb_rx_len = 0;
 volatile uint8_t usb_rx_ready = 0;
+
+uint32_t flash_write_address = 0x08010000; // Track the current write location
+uint8_t is_flash_erased = 0;               // Flag to ensure we only erase once
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -66,22 +70,32 @@ static void MX_SPI1_Init(void);
 typedef void (*pFunction)(void);
 
 void JumpToApplication(void) {
-    uint32_t app_address = 0x08010000; // Updated for 64KB offset
-
-    // 1. Get the address of the application's Reset Handler
+    uint32_t app_address = 0x08010000;
     uint32_t jump_address = *(__IO uint32_t*) (app_address + 4);
     pFunction Jump = (pFunction) jump_address;
 
-    // 2. De-initialize peripherals (HAL cleanup)
-    HAL_DeInit();
-
-    // 3. Disable all interrupts
+    // 1. Disable all global interrupts at the CPU level
     __disable_irq();
 
-    // 4. Set the Main Stack Pointer to the app's starting address
+    // 2. KILL THE USB: Disable its interrupt and shut off its clock
+    HAL_NVIC_DisableIRQ(USB_LP_CAN_RX0_IRQn);
+    __HAL_RCC_USB_CLK_DISABLE();
+
+    // 3. Reset the clock system to default HSI state
+    HAL_RCC_DeInit();
+
+    // 4. Clear and disable the SysTick timer
+    SysTick->CTRL = 0;
+    SysTick->LOAD = 0;
+    SysTick->VAL  = 0;
+
+    // 5. De-initialize the HAL layer
+    HAL_DeInit();
+
+    // 6. Set the Main Stack Pointer to the app's starting address
     __set_MSP(*(__IO uint32_t*) app_address);
 
-    // 5. Execute the jump
+    // 7. Execute the jump
     Jump();
 }
 /* USER CODE END 0 */
@@ -133,26 +147,79 @@ int main(void)
   /* USER CODE END 2 */
 
   /* Infinite loop */
-    /* USER CODE BEGIN WHILE */
+  /* USER CODE BEGIN WHILE */
       while (1)
       {
           // Fast blink Red LED so we know we are in Bootloader Mode
           HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_9);
           HAL_Delay(100);
 
+
           // Check if new USB data arrived
           if (usb_rx_ready == 1) {
-              // Echo the data or just toggle the Green LED (PE11) to prove it arrived
-              HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_11);
-              // Reset the flag to wait for the next packet
-              usb_rx_ready = 0;
-          }
-        /* USER CODE END WHILE */
 
-        /* USER CODE BEGIN 3 */
+              // Make a local copy so the ISR can safely overwrite the global buffer
+              uint32_t len = usb_rx_len;
+              uint8_t local_buf[2048];
+              memcpy(local_buf, usb_rx_buffer, len);
+              usb_rx_ready = 0;          // clear as early as possible
+
+              // 1. Erase the application space if this is the first packet
+              if (is_flash_erased == 0) {
+                  HAL_FLASH_Unlock();
+
+                  FLASH_EraseInitTypeDef EraseInitStruct;
+                  uint32_t PageError = 0;
+                  EraseInitStruct.TypeErase   = FLASH_TYPEERASE_PAGES;
+                  EraseInitStruct.PageAddress = 0x08010000;
+                  EraseInitStruct.NbPages     = 96;   // 192 KB / 2 KB
+
+                  if (HAL_FLASHEx_Erase(&EraseInitStruct, &PageError) != HAL_OK) {
+                      Error_Handler();
+                  }
+
+                  HAL_FLASH_Lock();
+                  is_flash_erased = 1;
+              }
+
+              // 2. Pad the *local* buffer if needed
+              uint8_t remainder = len % 4;
+              if (remainder != 0) {
+                  for (uint8_t i = 0; i < (4 - remainder); i++) {
+                      local_buf[len + i] = 0xFF;
+                  }
+                  len += (4 - remainder);
+              }
+
+              // 3. Write using the local copy
+              HAL_FLASH_Unlock();
+              for (uint32_t i = 0; i < len; i += 4) {
+                  uint32_t data_word = (local_buf[i])       |
+                                       (local_buf[i + 1] << 8)  |
+                                       (local_buf[i + 2] << 16) |
+                                       (local_buf[i + 3] << 24);
+
+                  if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, flash_write_address, data_word) == HAL_OK) {
+                      flash_write_address += 4;
+                  } else {
+                      Error_Handler();
+                  }
+              }
+              HAL_FLASH_Lock();
+
+              // Toggle Green LED
+              HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_11);
+
+              // Send ACK
+              uint8_t ack[] = "OK\n";
+              CDC_Transmit_FS(ack, sizeof(ack) - 1);
+          }
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
       }
-      /* USER CODE END 3 */
-    }
+  /* USER CODE END 3 */
+}
 
 /**
   * @brief System Clock Configuration

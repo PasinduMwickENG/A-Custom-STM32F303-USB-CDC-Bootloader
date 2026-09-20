@@ -1,0 +1,26 @@
+# STM32CubeIDE build output
+**/Debug/
+**/Release/
+**/build/
+
+# Generated compiler and linker artifacts
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+
+# STM32CubeIDE and Eclipse local settings
+**/.settings/
+.metadata/
+
+# Editor and operating-system files
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

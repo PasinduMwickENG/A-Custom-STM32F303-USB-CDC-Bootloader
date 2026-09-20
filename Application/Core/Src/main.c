@@ -73,7 +73,10 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
+	SCB->VTOR = 0x08010000;
 
+	  // 2. Re-enable global interrupts immediately so HAL_Init can use the SysTick
+	__enable_irq();
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -98,8 +101,7 @@ int main(void)
   MX_SPI1_Init();
   MX_USB_PCD_Init();
   /* USER CODE BEGIN 2 */
-  SCB->VTOR = 0x08010000;   /*Relocate the Vector Table to the application's flash start address*/
-  __enable_irq();  /* Re-enable global interrupts so HAL_Delay() can function */
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
