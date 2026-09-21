@@ -74,28 +74,40 @@ void JumpToApplication(void) {
     uint32_t jump_address = *(__IO uint32_t*) (app_address + 4);
     pFunction Jump = (pFunction) jump_address;
 
-    // 1. Disable all global interrupts at the CPU level
+    // 1. Force Windows to drop the COM port connection
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_12;           // USB D+ pin
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);
+    HAL_Delay(50); // Wait 50ms for the host PC to register the disconnect
+
+    // 2. Disable all global interrupts at the CPU level
     __disable_irq();
 
-    // 2. KILL THE USB: Disable its interrupt and shut off its clock
+    // 3. KILL THE USB: Disable its interrupt and shut off its clock
     HAL_NVIC_DisableIRQ(USB_LP_CAN_RX0_IRQn);
     __HAL_RCC_USB_CLK_DISABLE();
 
-    // 3. Reset the clock system to default HSI state
+    // 4. Reset the clock system to default HSI state
     HAL_RCC_DeInit();
 
-    // 4. Clear and disable the SysTick timer
+    // 5. Clear and disable the SysTick timer
     SysTick->CTRL = 0;
     SysTick->LOAD = 0;
     SysTick->VAL  = 0;
 
-    // 5. De-initialize the HAL layer
+    // 6. De-initialize the HAL layer
     HAL_DeInit();
 
-    // 6. Set the Main Stack Pointer to the app's starting address
+    // 7. Set the Main Stack Pointer to the app's starting address
     __set_MSP(*(__IO uint32_t*) app_address);
 
-    // 7. Execute the jump
+    // 8. Execute the jump
     Jump();
 }
 /* USER CODE END 0 */
@@ -124,7 +136,17 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
+  // Force Windows to recognize a physical USB disconnect by pulling PA12 LOW
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+    GPIO_InitStruct.Pin = GPIO_PIN_12;           // USB D+ pin
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;  // Push-Pull Output
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_12, GPIO_PIN_RESET);
+    HAL_Delay(50); // Keep it low for 50ms so Windows drops the dead COM port
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
@@ -134,16 +156,17 @@ int main(void)
   MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_9, GPIO_PIN_SET); // Turn on Red LED
-  HAL_Delay(100); // Give hardware a moment to stabilize
+  HAL_Delay(100);
 
-    // Check if the Blue USER button (PA0) is pressed (HIGH)
-    if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_RESET)
-    {
-        // Button NOT pressed -> jump to the application
+    // Use the isolated CCMRAM so the stack doesn't overwrite it
+    uint32_t *magic_word_address = (uint32_t *)0x10000000;
+
+    if (*magic_word_address == 0xDEADBEEF) {
+        *magic_word_address = 0x00000000; // Clear it immediately
+    }
+    else if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_RESET) {
         JumpToApplication();
     }
-
-    // If button WAS pressed, the code continues down into the while(1) loop
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -156,64 +179,77 @@ int main(void)
 
 
           // Check if new USB data arrived
-          if (usb_rx_ready == 1) {
 
-              // Make a local copy so the ISR can safely overwrite the global buffer
-              uint32_t len = usb_rx_len;
-              uint8_t local_buf[2048];
-              memcpy(local_buf, usb_rx_buffer, len);
-              usb_rx_ready = 0;          // clear as early as possible
+			if (usb_rx_ready == 1) {
 
-              // 1. Erase the application space if this is the first packet
-              if (is_flash_erased == 0) {
-                  HAL_FLASH_Unlock();
+				// Make a local copy so the ISR can safely overwrite the global buffer
+				uint32_t len = usb_rx_len;
+				uint8_t local_buf[2048];
+				memcpy(local_buf, usb_rx_buffer, len);
+				usb_rx_ready = 0;          // clear as early as possible
 
-                  FLASH_EraseInitTypeDef EraseInitStruct;
-                  uint32_t PageError = 0;
-                  EraseInitStruct.TypeErase   = FLASH_TYPEERASE_PAGES;
-                  EraseInitStruct.PageAddress = 0x08010000;
-                  EraseInitStruct.NbPages     = 96;   // 192 KB / 2 KB
+				// --- ROBUST JUMP CHECK ---
+				// Check the raw bytes directly to avoid <string.h> library quirks
+				if (len >= 4 && local_buf[0] == 'J' && local_buf[1] == 'U' && local_buf[2] == 'M' && local_buf[3] == 'P') {
 
-                  if (HAL_FLASHEx_Erase(&EraseInitStruct, &PageError) != HAL_OK) {
-                      Error_Handler();
-                  }
+					uint8_t ack[] = "BOOT\n";
+					CDC_Transmit_FS(ack, sizeof(ack) - 1);
+					HAL_Delay(100); // Give the hardware time to push the text up the USB cable
+					JumpToApplication();
+				}
+				else {
+					// --- NORMAL FLASH WRITING ---
+					// If it's NOT a jump command, process it as firmware data.
 
-                  HAL_FLASH_Lock();
-                  is_flash_erased = 1;
-              }
+					// 1. Erase the application space if this is the first packet
+					if (is_flash_erased == 0) {
+						HAL_FLASH_Unlock();
+						FLASH_EraseInitTypeDef EraseInitStruct;
+						uint32_t PageError = 0;
+						EraseInitStruct.TypeErase   = FLASH_TYPEERASE_PAGES;
+						EraseInitStruct.PageAddress = 0x08010000;
+						EraseInitStruct.NbPages     = 96;   // 192 KB / 2 KB
 
-              // 2. Pad the *local* buffer if needed
-              uint8_t remainder = len % 4;
-              if (remainder != 0) {
-                  for (uint8_t i = 0; i < (4 - remainder); i++) {
-                      local_buf[len + i] = 0xFF;
-                  }
-                  len += (4 - remainder);
-              }
+						if (HAL_FLASHEx_Erase(&EraseInitStruct, &PageError) != HAL_OK) {
+							Error_Handler();
+						}
+						HAL_FLASH_Lock();
+						is_flash_erased = 1;
+					}
 
-              // 3. Write using the local copy
-              HAL_FLASH_Unlock();
-              for (uint32_t i = 0; i < len; i += 4) {
-                  uint32_t data_word = (local_buf[i])       |
-                                       (local_buf[i + 1] << 8)  |
-                                       (local_buf[i + 2] << 16) |
-                                       (local_buf[i + 3] << 24);
+					// 2. Pad the *local* buffer if needed
+					uint8_t remainder = len % 4;
+					if (remainder != 0) {
+						for (uint8_t i = 0; i < (4 - remainder); i++) {
+							local_buf[len + i] = 0xFF;
+						}
+						len += (4 - remainder);
+					}
 
-                  if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, flash_write_address, data_word) == HAL_OK) {
-                      flash_write_address += 4;
-                  } else {
-                      Error_Handler();
-                  }
-              }
-              HAL_FLASH_Lock();
+					// 3. Write using the local copy
+					HAL_FLASH_Unlock();
+					for (uint32_t i = 0; i < len; i += 4) {
+						uint32_t data_word = (local_buf[i])       |
+											 (local_buf[i + 1] << 8)  |
+											 (local_buf[i + 2] << 16) |
+											 (local_buf[i + 3] << 24);
 
-              // Toggle Green LED
-              HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_11);
+						if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, flash_write_address, data_word) == HAL_OK) {
+							flash_write_address += 4;
+						} else {
+							Error_Handler();
+						}
+					}
+					HAL_FLASH_Lock();
 
-              // Send ACK
-              uint8_t ack[] = "OK\n";
-              CDC_Transmit_FS(ack, sizeof(ack) - 1);
-          }
+					// Toggle Green LED to confirm flash write
+					HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_11);
+
+					// Send ACK to Python
+					uint8_t ack[] = "OK\n";
+					CDC_Transmit_FS(ack, sizeof(ack) - 1);
+				}
+			}
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
