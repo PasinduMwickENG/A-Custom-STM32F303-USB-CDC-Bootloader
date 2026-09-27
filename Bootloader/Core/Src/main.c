@@ -23,7 +23,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "bl_protocol.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -47,12 +47,10 @@ I2C_HandleTypeDef hi2c1;
 SPI_HandleTypeDef hspi1;
 
 /* USER CODE BEGIN PV */
-uint8_t usb_rx_buffer[2048];
-uint32_t usb_rx_len = 0;
-volatile uint8_t usb_rx_ready = 0;
-
-uint32_t flash_write_address = 0x08010000; // Track the current write location
-uint8_t is_flash_erased = 0;               // Flag to ensure we only erase once
+/* Started only when entering bootloader mode. Once started, the IWDG
+ * cannot be stopped - it keeps running across the jump, so the
+ * application must keep refreshing it (see Application main.c). */
+static uint8_t iwdg_started = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -69,8 +67,34 @@ static void MX_SPI1_Init(void);
 /* Function pointer for jumping */
 typedef void (*pFunction)(void);
 
-void JumpToApplication(void) {
-    uint32_t app_address = 0x08010000;
+/* The HAL IWDG driver is not part of this project, so talk to the
+ * watchdog registers directly (KR/PR/RLR/SR). */
+#define IWDG_KEY_RELOAD  0xAAAAu
+#define IWDG_KEY_ENABLE  0xCCCCu
+#define IWDG_KEY_ACCESS  0x5555u
+
+static void IWDG_Feed(void) {
+    IWDG->KR = IWDG_KEY_RELOAD;
+}
+
+static void IWDG_Start(void) {
+    IWDG->KR  = IWDG_KEY_ENABLE;         /* starts the counter and forces LSI on */
+    IWDG->KR  = IWDG_KEY_ACCESS;
+    IWDG->PR  = 5;                      /* /128 -> ~312 Hz @ 40 kHz LSI */
+    IWDG->RLR = 3000 & 0xFFFu;          /* ~9.6 s timeout               */
+    while (IWDG->SR != 0u) { }          /* wait for PR/RLR to apply     */
+    IWDG->KR  = IWDG_KEY_RELOAD;
+    iwdg_started = 1;
+}
+
+uint8_t JumpToApplication(void) {
+    uint32_t app_address = APP_FLASH_BASE_ADDRESS;
+
+    /* Refuse to jump into a missing or corrupt vector table. */
+    if (!BL_VectorTableValid()) {
+        return 0;
+    }
+
     uint32_t jump_address = *(__IO uint32_t*) (app_address + 4);
     pFunction Jump = (pFunction) jump_address;
 
@@ -89,26 +113,40 @@ void JumpToApplication(void) {
     // 2. Disable all global interrupts at the CPU level
     __disable_irq();
 
-    // 3. KILL THE USB: Disable its interrupt and shut off its clock
+    // 3. Clear every pending/enable bit so nothing fires in the app
+    for (uint32_t i = 0; i < 8u; i++) {
+        NVIC->ICER[i] = 0xFFFFFFFFu;
+        NVIC->ICPR[i] = 0xFFFFFFFFu;
+    }
+    SCB->ICSR = SCB_ICSR_PENDSVCLR_Msk | SCB_ICSR_PENDSTCLR_Msk;
+
+    // 4. KILL THE USB: Disable its interrupt and shut off its clock
     HAL_NVIC_DisableIRQ(USB_LP_CAN_RX0_IRQn);
     __HAL_RCC_USB_CLK_DISABLE();
 
-    // 4. Reset the clock system to default HSI state
+    // 5. Reset the clock system to default HSI state
     HAL_RCC_DeInit();
 
-    // 5. Clear and disable the SysTick timer
+    // 6. Clear and disable the SysTick timer
     SysTick->CTRL = 0;
     SysTick->LOAD = 0;
     SysTick->VAL  = 0;
 
-    // 6. De-initialize the HAL layer
+    // 7. De-initialize the HAL layer
     HAL_DeInit();
 
-    // 7. Set the Main Stack Pointer to the app's starting address
+    // 8. Give the application a fresh watchdog window (IWDG, once started,
+    //    cannot be stopped - the app must keep refreshing it)
+    if (iwdg_started) {
+        IWDG_Feed();
+    }
+
+    // 9. Set the Main Stack Pointer to the app's starting address
     __set_MSP(*(__IO uint32_t*) app_address);
 
-    // 8. Execute the jump
+    // 10. Execute the jump
     Jump();
+    return 1; // unreachable
 }
 /* USER CODE END 0 */
 
@@ -159,97 +197,40 @@ int main(void)
   HAL_Delay(100);
 
     // Use the isolated CCMRAM so the stack doesn't overwrite it
-    uint32_t *magic_word_address = (uint32_t *)0x10000000;
+    uint32_t *magic_word_address = (uint32_t *)MAGIC_WORD_ADDRESS;
 
-    if (*magic_word_address == 0xDEADBEEF) {
+    if (*magic_word_address == MAGIC_WORD_UPDATE_REQUEST) {
         *magic_word_address = 0x00000000; // Clear it immediately
     }
     else if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0) == GPIO_PIN_RESET) {
-        JumpToApplication();
+        // Auto-boot only into a verified, intact image; otherwise fall
+        // through and stay in bootloader mode.
+        if (BL_ImageIsValid()) {
+            JumpToApplication();
+        }
     }
+
+    /* --- Entering interactive bootloader mode --- */
+    // Start the watchdog now: if the host never finishes the update we
+    // reset and the normal boot path gets another chance. IWDG runs at
+    // ~312 Hz with /128 prescaler; reload 3000 ~= 9.6 s timeout.
+    IWDG_Start();
+
+    BL_ProtocolInit();
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
       while (1)
       {
+          IWDG_Feed();
+
           // Fast blink Red LED so we know we are in Bootloader Mode
           HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_9);
           HAL_Delay(100);
 
-
-          // Check if new USB data arrived
-
-			if (usb_rx_ready == 1) {
-
-				// Make a local copy so the ISR can safely overwrite the global buffer
-				uint32_t len = usb_rx_len;
-				uint8_t local_buf[2048];
-				memcpy(local_buf, usb_rx_buffer, len);
-				usb_rx_ready = 0;          // clear as early as possible
-
-				// --- ROBUST JUMP CHECK ---
-				// Check the raw bytes directly to avoid <string.h> library quirks
-				if (len >= 4 && local_buf[0] == 'J' && local_buf[1] == 'U' && local_buf[2] == 'M' && local_buf[3] == 'P') {
-
-					uint8_t ack[] = "BOOT\n";
-					CDC_Transmit_FS(ack, sizeof(ack) - 1);
-					HAL_Delay(100); // Give the hardware time to push the text up the USB cable
-					JumpToApplication();
-				}
-				else {
-					// --- NORMAL FLASH WRITING ---
-					// If it's NOT a jump command, process it as firmware data.
-
-					// 1. Erase the application space if this is the first packet
-					if (is_flash_erased == 0) {
-						HAL_FLASH_Unlock();
-						FLASH_EraseInitTypeDef EraseInitStruct;
-						uint32_t PageError = 0;
-						EraseInitStruct.TypeErase   = FLASH_TYPEERASE_PAGES;
-						EraseInitStruct.PageAddress = 0x08010000;
-						EraseInitStruct.NbPages     = 96;   // 192 KB / 2 KB
-
-						if (HAL_FLASHEx_Erase(&EraseInitStruct, &PageError) != HAL_OK) {
-							Error_Handler();
-						}
-						HAL_FLASH_Lock();
-						is_flash_erased = 1;
-					}
-
-					// 2. Pad the *local* buffer if needed
-					uint8_t remainder = len % 4;
-					if (remainder != 0) {
-						for (uint8_t i = 0; i < (4 - remainder); i++) {
-							local_buf[len + i] = 0xFF;
-						}
-						len += (4 - remainder);
-					}
-
-					// 3. Write using the local copy
-					HAL_FLASH_Unlock();
-					for (uint32_t i = 0; i < len; i += 4) {
-						uint32_t data_word = (local_buf[i])       |
-											 (local_buf[i + 1] << 8)  |
-											 (local_buf[i + 2] << 16) |
-											 (local_buf[i + 3] << 24);
-
-						if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_WORD, flash_write_address, data_word) == HAL_OK) {
-							flash_write_address += 4;
-						} else {
-							Error_Handler();
-						}
-					}
-					HAL_FLASH_Lock();
-
-					// Toggle Green LED to confirm flash write
-					HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_11);
-
-					// Send ACK to Python
-					uint8_t ack[] = "OK\n";
-					CDC_Transmit_FS(ack, sizeof(ack) - 1);
-				}
-			}
+          // Drain complete protocol frames reassembled from USB packets
+          BL_ProtocolPoll();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */

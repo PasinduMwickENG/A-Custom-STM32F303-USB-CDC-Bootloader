@@ -47,7 +47,7 @@ MEMORY
 {
   CCMRAM    (xrw)    : ORIGIN = 0x10000000,   LENGTH = 8K
   RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 40K
-  FLASH    (rx)    : ORIGIN = 0x08010000,   LENGTH = 192K  /* set application's start point in the flash memory , 256K total - 64K bootloader*/
+  FLASH    (rx)    : ORIGIN = 0x08010000,   LENGTH = 190K  /* set application's start point in the flash memory , 256K total - 64K bootloader - 2K metadata page */
 }
 
 /* Sections */

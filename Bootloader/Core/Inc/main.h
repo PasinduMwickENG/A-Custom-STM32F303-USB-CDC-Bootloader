@@ -53,7 +53,7 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
-
+uint8_t JumpToApplication(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
@@ -117,7 +117,18 @@ void Error_Handler(void);
 #define MEMS_INT2_GPIO_Port GPIOE
 
 /* USER CODE BEGIN Private defines */
+/* Memory map: 64K bootloader @ 0x08000000, 190K writable application region,
+ * last 2K flash page reserved for the bootloader-written metadata record. */
+#define APP_FLASH_BASE_ADDRESS   0x08010000U
+#define APP_FLASH_WRITABLE_END   0x0803F800U
+#define APP_METADATA_ADDRESS     0x0803F800U
+#define APP_FLASH_END            0x08040000U
 
+/* Shared mailbox in CCMRAM used by the application to request update mode. */
+#define MAGIC_WORD_ADDRESS       0x10000000U
+#define MAGIC_WORD_UPDATE_REQUEST 0xDEADBEEFU
+
+#define BOOTLOADER_VERSION       0x0100U   /* v1.0 */
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

@@ -22,7 +22,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "leds.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -46,9 +46,6 @@ I2C_HandleTypeDef hi2c1;
 SPI_HandleTypeDef hspi1;
 
 /* USER CODE BEGIN PV */
-uint8_t app_rx_buffer[64];
-uint32_t app_rx_len = 0;
-volatile uint8_t app_rx_ready = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -108,23 +105,11 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-	  HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_8); // Toggle Blue LED
-	  HAL_Delay(1000);
+	  // Feed the watchdog started by the bootloader (IWDG cannot be
+	  // disabled once started, so it survives the jump from 0x08010000).
+	  IWDG->KR = 0xAAAAu;
 
-		if (app_rx_ready == 1) {
-			app_rx_ready = 0;
-
-			// Check if the PC sent the trigger command
-			if (strncmp((char*)app_rx_buffer, "UPDATE", 6) == 0) {
-
-				// 1. Write the Magic Word to the end of RAM
-				uint32_t *magic_word_address = (uint32_t *)0x10000000;
-				*magic_word_address = 0xDEADBEEF;
-
-				// 2. Trigger a System Reset!
-				NVIC_SystemReset();
-			}
-		}
+    blink_led();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */

@@ -23,6 +23,7 @@
 
 /* USER CODE BEGIN INCLUDE */
 #include <string.h>
+#include "bl_protocol.h"
 /* USER CODE END INCLUDE */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -31,9 +32,6 @@
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
-extern uint8_t usb_rx_buffer[2048];
-extern uint32_t usb_rx_len;
-extern volatile uint8_t usb_rx_ready;
 /* USER CODE END PV */
 
 /** @addtogroup STM32_USB_OTG_DEVICE_LIBRARY
@@ -261,21 +259,15 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
-	// Prevent buffer overflow
-	  if (*Len <= 2048) {
-	      // Copy the incoming USB data into our global buffer
-	      memcpy(usb_rx_buffer, Buf, *Len);
-	      usb_rx_len = *Len;
+	// Feed the protocol ring buffer; the main loop reassembles frames
+	// that may span multiple 64-byte USB packets.
+	BL_OnUsbRx(Buf, *Len);
 
-	      // Alert main.c that a new packet is ready to process
-	      usb_rx_ready = 1;
-	  }
+	// These two lines are required to keep the USB hardware listening for the next packet
+	USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
+	USBD_CDC_ReceivePacket(&hUsbDeviceFS);
 
-	  // These two lines are required to keep the USB hardware listening for the next packet
-	  USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
-	  USBD_CDC_ReceivePacket(&hUsbDeviceFS);
-
-	  return (USBD_OK);
+	return (USBD_OK);
   /* USER CODE END 6 */
 }
 

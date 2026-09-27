@@ -22,18 +22,19 @@
 #include "usbd_cdc_if.h"
 
 /* USER CODE BEGIN INCLUDE */
-
+#include <string.h>
 /* USER CODE END INCLUDE */
 
 /* Private typedef -----------------------------------------------------------*/
 /* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+#define MAGIC_WORD_ADDRESS        0x10000000U
+#define MAGIC_WORD_UPDATE_REQUEST 0xDEADBEEFU
+/* USER CODE END PD */
 /* Private macro -------------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
-extern uint8_t app_rx_buffer[64];
-extern uint32_t app_rx_len;
-extern volatile uint8_t app_rx_ready;
 /* USER CODE END PV */
 
 /** @addtogroup STM32_USB_OTG_DEVICE_LIBRARY
@@ -261,11 +262,17 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
-	for (uint32_t i = 0; i < *Len; i++) {
-	      app_rx_buffer[i] = Buf[i];
-	  }
-	  app_rx_len = *Len;
-	  app_rx_ready = 1;
+	// Handle the trigger command directly in the receive ISR instead of
+	// polling a flag from the main loop, so the reboot happens immediately.
+	if (*Len >= 6u && strncmp((char*)Buf, "UPDATE", 6) == 0) {
+		// 1. Write the Magic Word to the end of RAM
+		uint32_t *magic_word_address = (uint32_t *)MAGIC_WORD_ADDRESS;
+		*magic_word_address = MAGIC_WORD_UPDATE_REQUEST;
+
+		// 2. Trigger a System Reset!
+		NVIC_SystemReset();
+		/* unreachable */
+	}
 
 	  USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
 	  USBD_CDC_ReceivePacket(&hUsbDeviceFS);
